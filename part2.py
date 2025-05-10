@@ -5,6 +5,7 @@ import ast # For safely evaluating string representations of lists
 import math
 import numpy as np # For Euclidean distance and array operations
 from part1 import run_part1
+from graphController import plot_results
 
 def load_data():
     """Loads data from the provided CSV files."""
@@ -208,7 +209,14 @@ def solve_lp_part2(params, omega_percentage):
 
     # 10. Exceed priority weight threshold: sum_j x_j w_j >= (omega / 100) * M_w
     required_total_weight = (omega_percentage / 100.0) * M_w
-    m.addConstr(gp.quicksum(x[j_idx] * w_j[j_idx] for j_idx in range(num_jobs)) >= required_total_weight, name="prio_weight_threshold")
+    m.addConstr(
+    gp.quicksum(
+        y[i_idx, j_idx] * w_j[j_idx]
+        for i_idx in range(num_seekers)
+        for j_idx in range(num_jobs)
+    ) >= required_total_weight,
+    name="prio_weight_threshold"
+)
             
     print("Model for Part 2 built. Starting optimization...")
     m.optimize()
@@ -218,7 +226,6 @@ def solve_lp_part2(params, omega_percentage):
         print(f"  Minimized d_max: {m.objVal:.4f}")
         
         achieved_total_weight = sum(x[j_idx].X * w_j[j_idx] for j_idx in range(num_jobs))
-        print(f"  Achieved total priority weight (sum x_j w_j): {achieved_total_weight:.2f} (Required: >= {required_total_weight:.2f})")
         
         assignments_count = 0
         print("  Assignments (y_ij = 1):")
@@ -257,18 +264,69 @@ def solve_lp_part2(params, omega_percentage):
 if __name__ == "__main__":
     try:
         jobs_df, seekers_df, distances_df = load_data()
-        
+
+        # --- Part 1 ----------------------------------------------------
         M_w_part1_result = run_part1()
         print(f"Using M_w from Part 1: {M_w_part1_result:.0f}")
-        
-        params_part2 = preprocess_data_part2(jobs_df, seekers_df, distances_df, M_w_part1_result)
-        
+
+        # --- Part 2 preprocessing -------------------------------------
+        params_part2 = preprocess_data_part2(
+            jobs_df, seekers_df, distances_df, M_w_part1_result
+        )
+
+        # ω values to test
         omega_values_to_test = [70, 75, 80, 85, 90, 95, 100]
-        
+
+        # containers for graph data
+        omega_hist, dmax_hist, weight_hist, fill_hist = [], [], [], []
+
+        total_positions = sum(params_part2["P_j"])
+        num_seekers     = params_part2["num_seekers"]
+        num_jobs        = params_part2["num_jobs"]
+        w_j             = params_part2["w_j"]
+
+        # --- run each scenario ----------------------------------------
         for omega_val in omega_values_to_test:
-            solve_lp_part2(params_part2, omega_val)
-            
+            model = solve_lp_part2(params_part2, omega_val)
+
+            if model.Status != gp.GRB.OPTIMAL:
+                continue   # skip infeasible ω
+
+            # record ω
+            omega_hist.append(omega_val)
+
+            # record d_max
+            dmax_hist.append(model.getVarByName("d_max").X)
+
+            # achieved priority weight  Σ_i,j y_ij * w_j
+            ach_weight = sum(
+                model.getVarByName(f"y[{i},{j}]").X * w_j[j]
+                for i in range(num_seekers)
+                for j in range(num_jobs)
+            )
+            weight_hist.append(ach_weight)
+
+            # fill-rate  (assigned / total positions)
+            assigned = sum(
+                model.getVarByName(f"y[{i},{j}]").X
+                for i in range(num_seekers)
+                for j in range(num_jobs)
+            )
+            fill_hist.append(assigned / total_positions if total_positions else 0)
+
+        # --- plot everything at once ----------------------------------
+        plot_results(
+            omega_hist,   # x-axis
+            dmax_hist,    # y-series 1
+            weight_hist,  # y-series 2
+            fill_hist     # y-series 3
+        )
+        
+        print("\n────────  d_max results by ω  ────────")
+        for ω, d in zip(omega_hist, dmax_hist):
+            print(f"  ω = {ω:3d}%   →   d_max = {d:.4f}")
+
     except Exception as e:
-        print(f"An error occurred in the main execution: {e}")
+        print(f"An error occurred: {e}")
         import traceback
         traceback.print_exc()
