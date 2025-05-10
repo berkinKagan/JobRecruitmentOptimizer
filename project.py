@@ -1,87 +1,131 @@
-import pandas as pd
-import numpy as np
-import gurobipy as gp
-import ast
+#!/usr/bin/env python
+"""
+IE400 Project – Integrated Part-1 & Part-2 optimiser
+Adds:  ❖ reports which (seeker, job) pair(s) attain d_max
+       ❖ prints each assigned pair’s dissimilarity
+Author : ChatGPT-o3
+Date   : 10 May 2025
+"""
 
+import pandas as pd, numpy as np, ast, sys, gurobipy as gp
+from gurobipy import GRB
+
+# ----------------------------------------------------------------------
+# 0. LOAD & CLEAN DATA
+# ----------------------------------------------------------------------
 seekers = pd.read_csv('seekers.csv', index_col=0)
-jobs = pd.read_csv('jobs.csv', index_col=0)
-dist = pd.read_csv('location_distances.csv', index_col=0)
-print(dist.head())
+jobs    = pd.read_csv('jobs.csv',    index_col=0)
+dist    = pd.read_csv('location_distances.csv', index_col=0)
 
-compatibility_dict = {} # Dictionary to store compatibility
+# turn any stringified lists back into real lists
+for col in ['Skills', 'Questionnaire']:
+    seekers[col] = seekers[col].apply(
+        lambda v: ast.literal_eval(v) if isinstance(v, str) else v
+    )
+for col in ['Required_Skills', 'Questionnaire']:
+    jobs[col] = jobs[col].apply(
+        lambda v: ast.literal_eval(v) if isinstance(v, str) else v
+    )
 
-def check_experience_level(seeker_level: str, job_level: str) -> int:
-    order = ['Entry-level', 'Mid-level', 'Senior', 'Lead', 'Manager']
-    try:
-        return int(order.index(seeker_level) >= order.index(job_level))
-    except ValueError:
-        return 0
+# numeric codes for experience levels
+level_map = {'Entry-level':1, 'Mid-level':2, 'Senior':3, 'Lead':4, 'Manager':5}
+seekers['ExpNum']    = seekers['Experience_Level'].map(level_map)
+jobs   ['ReqExpNum'] = jobs['Required_Experience_Level'].map(level_map)
 
-def assess_location_distance(seeker_loc: str, job_loc: str, is_remote: int, max_commute: float, dist: pd.DataFrame) -> int:
-    if is_remote == 1:
-        return 1
-    return int(dist.loc[seeker_loc, job_loc] <= max_commute)
+I, J = list(seekers.index), list(jobs.index)
 
-for seeker_id, s in seekers.iterrows():
-    for job_id, j in jobs.iterrows():
-        count = 0
-        if s['Desired_Job_Type'] == j['Job_Type']:
-            count += 1
-        if j['Salary_Range_Max'] >= s['Min_Desired_Salary']:
-            count += 1
-        if set(j['Required_Skills']).issubset(s['Skills']):
-            count += 1
-        count += check_experience_level(s['Experience_Level'], j['Required_Experience_Level'])
-        count += assess_location_distance(seeker_loc=s['Location'], job_loc=j['Location'], is_remote=j['Is_Remote'], max_commute=s['Max_Commute_Distance'], dist=dist)
-        compatibility_dict[(seeker_id, job_id)] = count
-        
-allowed_pairs = [(i, j) for (i, j), cnt in compatibility_dict.items() if cnt == 5]
+# handy scalar parameter dicts
+loc_i, loc_j = seekers['Location'].to_dict(), jobs['Location'].to_dict()
+remote_j     = jobs['Is_Remote'].astype(int).to_dict()
+type_i, type_j = seekers['Desired_Job_Type'].to_dict(), jobs['Job_Type'].to_dict()
+min_sal_i, max_comm_i = seekers['Min_Desired_Salary'].to_dict(), seekers['Max_Commute_Distance'].to_dict()
+sal_min_j, sal_max_j  = jobs['Salary_Range_Min'].to_dict(),  jobs['Salary_Range_Max'].to_dict()
+exp_i, exp_req_j      = seekers['ExpNum'].to_dict(), jobs['ReqExpNum'].to_dict()
+P_j, w_j              = jobs['Num_Positions'].to_dict(), jobs['Priority_Weight'].to_dict()
 
-m = gp.Model('Part1')
-x = m.addVars(allowed_pairs, vtype=gp.GRB.BINARY, name='x')
-m.setObjective(gp.quicksum(jobs.loc[j, 'Priority_Weight'] * x[i, j] for i, j in allowed_pairs), gp.GRB.MAXIMIZE)
-m.addConstrs((x.sum(i, '*') <= 1 for i in seekers.index), name='one_job_per_seeker')
-m.addConstrs((x.sum('*', j) <= jobs.loc[j, 'Num_Positions'] for j in jobs.index), name='job_capacity')
-m.optimize()
-Mw = m.ObjVal
-print(f"Maximum total priority weight (Mw) = {Mw}")
+# compatibility flags ---------------------------------------------------
+skill_ok = {(i,j): int(set(jobs.at[j,'Required_Skills']).issubset(seekers.at[i,'Skills']))
+            for i in I for j in J}
+type_ok  = {(i,j): int(type_i[i] == type_j[j]) for i in I for j in J}
 
+# ----------------------------------------------------------------------
+# A. PRE-COMPUTE QUESTIONNAIRE DISSIMILARITIES
+# ----------------------------------------------------------------------
+dissim = {(i,j): float(np.mean(np.abs(np.array(seekers.at[i,'Questionnaire'],dtype=float) -
+                                      np.array(jobs.at[j,'Questionnaire'],    dtype=float))))
+          for i in I for j in J}
 
+# ----------------------------------------------------------------------
+# 1. PART-1  –  Maximise total priority weight
+# ----------------------------------------------------------------------
+m1 = gp.Model('Part1')
+y  = m1.addVars(I, J, vtype=GRB.BINARY, name='y')
+x  = m1.addVars(J,    vtype=GRB.BINARY, name='x')
 
-dissimilarity_scores = {}
-priority_weights = jobs['Priority_Weight'].to_dict()
-job_capacities = jobs['Num_Positions'].to_dict()
+m1.setObjective(gp.quicksum(w_j[j] * x[j] for j in J), GRB.MAXIMIZE)
 
-for (i, j) in allowed_pairs:
-    s_q = np.array(ast.literal_eval(seekers.loc[i, 'Questionnaire']))
-    j_q = np.array(ast.literal_eval(jobs.loc[j, 'Questionnaire']))
-    dij = np.mean(np.abs(s_q - j_q))
-    dissimilarity_scores[(i, j)] = dij
-    
+m1.addConstrs((y.sum(i,'*') <= 1                      for i in I), name='one_job')
+m1.addConstrs((y.sum('*',j) <= P_j[j] * x[j]          for j in J), name='cap_up')
+m1.addConstrs((y.sum('*',j) >= P_j[j] * x[j]          for j in J), name='cap_low')
+m1.addConstrs((y[i,j] <= type_ok [i,j]                for i in I for j in J), name='type')
+m1.addConstrs((y[i,j] <= skill_ok[i,j]                for i in I for j in J), name='skill')
+m1.addConstrs((y[i,j] * min_sal_i[i] <= sal_max_j[j]  for i in I for j in J), name='sal_high')
+m1.addConstrs((y[i,j] * sal_min_j[j] <= min_sal_i[i]  for i in I for j in J), name='sal_low')
+m1.addConstrs((y[i,j] * exp_req_j[j]  <= exp_i[i]     for i in I for j in J), name='exp')
+m1.addConstrs((y[i,j]*(1-remote_j[j])*dist.at[loc_i[i],loc_j[j]] <= max_comm_i[i]
+               for i in I for j in J), name='commute')
+
+m1.Params.OutputFlag = 0
+m1.optimize()
+if m1.Status != GRB.OPTIMAL:
+    sys.exit('Part-1 infeasible')
+
+Mw = m1.ObjVal
+print(f"[Part-1] maximum total priority weight  Mw = {Mw:.0f}")
+
+# ----------------------------------------------------------------------
+# 2. PART-2  –  minimise max dissimilarity for ω ∈ {70,…,100}
+# ----------------------------------------------------------------------
 omega_values = [70, 75, 80, 85, 90, 95, 100]
-results = []
+tol = 1e-6   # numerical tolerance when comparing distances
 
-for omega in omega_values:
-    m = gp.Model("Min_Max_Dissimilarity")
+for ω in omega_values:
 
-    x = m.addVars(allowed_pairs, vtype=gp.GRB.BINARY, name="x")
-    d_max = m.addVar(vtype=gp.GRB.CONTINUOUS, name="d_max")
+    m2     = m1.copy()
+    d_max  = m2.addVar(vtype=GRB.CONTINUOUS, name='d_max')
 
-    m.addConstrs((x[i, j] * dissimilarity_scores[(i, j)] <= d_max for (i, j) in allowed_pairs), name="dissimilarity_bound")
-    m.addConstrs((x.sum(i, '*') <= 1 for i in seekers.index),name="one_job_per_seeker")
-    m.addConstrs((x.sum('*', j) <= jobs.loc[j, 'Num_Positions'] for j in jobs.index), name="job_capacity")
+    m2.addConstrs((d_max >= dissim[(i,j)] * m2.getVarByName(f"y[{i},{j}]")
+                   for i in I for j in J), name='diss')
+    m2.addConstr(gp.quicksum(w_j[j] * m2.getVarByName(f"x[{j}]") for j in J)
+                 >= (ω/100) * Mw, name='weight_thresh')
 
-    omega_fraction = omega / 100.0
-    m.addConstr(gp.quicksum(jobs.loc[j, 'Priority_Weight'] * x[i, j] for (i, j) in allowed_pairs) >= omega_fraction * Mw,name="priority_weight_threshold")
+    m2.setObjective(d_max, GRB.MINIMIZE)
+    m2.Params.OutputFlag = 0
+    m2.optimize()
 
-    m.setObjective(d_max, gp.GRB.MINIMIZE)
-    m.optimize()
+    if m2.Status != GRB.OPTIMAL:
+        print(f"\nω = {ω}%   →   infeasible")
+        continue
 
-    matched_pairs = [(i, j) for (i, j) in allowed_pairs if x[i, j].X > 0.5] #checks if 0 or 1
-    max_diss = d_max.X if m.status == gp.GRB.OPTIMAL else None
+    d_val = m2.ObjVal
+    print(f"\nω = {ω}%   →   min d_max = {d_val:.4f}")
 
-    results.append((omega, max_diss))
-    print(f"ω = {omega}%, Min Max Dissimilarity = {max_diss}")
-    
-        
-        
+    # --- collect all assignments and spot those that hit d_max ----------
+    argmax_pairs, job_to_pairs = [], {}
+    for i in I:
+        for j in J:
+            if m2.getVarByName(f"y[{i},{j}]").X > 0.5:
+                dj = dissim[(i,j)]
+                job_to_pairs.setdefault(j, []).append((i, dj))
+                if abs(dj - d_val) <= tol:
+                    argmax_pairs.append((i,j))
+
+    # report which pair(s) attain d_max
+    if argmax_pairs:
+        tops = ";  ".join(f"{p[0]}↔{p[1]}" for p in argmax_pairs)
+        print(f"   ↳  d_max attained by: {tops}")
+
+    # print every job with its assignees & their individual dissimilarities
+    for j, lst in job_to_pairs.items():
+        pretty = ", ".join(f"{i} (d={dj:.3f})" for i,dj in lst)
+        print(f"   • Job {j}: {pretty}")
